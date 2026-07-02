@@ -1,0 +1,14 @@
+.env
+__pycache__/
+*.pyc
+# Per-trial workspace artifacts that occasionally get written into skills/<robot>/
+skills/*/library.db
+skills/*/failures.db
+skills/*/subtasks/
+skills/*/episodes.jsonl
+skills/*/episodes.dry_run.jsonl
+skills/*/skill_doc_index.json
+
+# Generated programs from interactive CLI sessions / dry-runs
+output/*.py
+.DS_Store

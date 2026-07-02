@@ -1,0 +1,16 @@
+# catkin
+build/
+devel/
+.catkin_workspace
+src/CMakeLists.txt
+
+# local runtime config
+.env
+
+# local (non-example) configs
+src/franka_robot_apis/config/*.yaml
+!src/franka_robot_apis/config/*.example.yaml
+
+# python
+*.pyc
+__pycache__/

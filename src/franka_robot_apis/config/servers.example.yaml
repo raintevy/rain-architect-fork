@@ -1,0 +1,48 @@
+# Inference / external service endpoints used by franka_robot_apis.
+#
+# Copy this file to `servers.yaml` and edit it for your setup. Real configs
+# (servers.yaml, cameras.yaml, robot.yaml) are git-ignored.
+#
+# Most perception/motion nodes read these as PRIVATE ROS params (~param), so the
+# in-code defaults (127.0.0.1) only apply when nothing is loaded. The defaults
+# below mirror the code; point them at the machines that host each model server.
+
+# WebSocket IK / trajectory generator (cuRobo-backed) used by the EE motion node.
+move_ee_controller_node:
+  ws_host: "127.0.0.1"
+  ws_port: 8765
+
+# Vision-language (VQA / grasp verification) backend.
+# vqa_server_name: one of "azure_openai" | "openai" | "qwen"
+# (API keys for azure/openai come from .env, NOT from this file.)
+vqa_service:
+  vqa_server_name: "azure_openai"
+  qwen_host: "127.0.0.1"     # only used when vqa_server_name == "qwen"
+  qwen_port: 8000
+  model_id: "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"
+
+grasp_vqa_service:
+  vqa_server_name: "azure_openai"
+  qwen_host: "127.0.0.1"
+  qwen_port: 8000
+
+# Open-vocabulary detection / segmentation (Grounded-SAM2).
+object_detection_service:
+  sam2_url: "ws://127.0.0.1:8766/detect_objects"
+  anygrasp_url: "ws://127.0.0.1:8767/get_saved_grasp"
+
+object_mask_service:
+  sam2_url: "ws://127.0.0.1:8766/get_object_mask"
+
+# Grasp synthesis (AnyGrasp).
+grasp_config_service:
+  anygrasp_url: "ws://127.0.0.1:8767/get_grasp_config"
+
+# Placement-pose prediction (AnyPlace) + segmentation it depends on.
+placing_pose_service:
+  sam2_url: "ws://127.0.0.1:8766/get_object_mask"
+  anyplace_port: 8768       # host is derived from sam2_url unless overridden
+
+# Semantic keypoints (DIFT).
+keypoints_service:
+  dift_base_url: "ws://127.0.0.1:8769"

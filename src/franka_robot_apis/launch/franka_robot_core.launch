@@ -1,0 +1,80 @@
+<launch>
+  <!-- ============================ Arguments ============================ -->
+  <!-- Franka Control Interface IP (172.16.0.2 is the Franka default). -->
+  <arg name="robot_ip"       default="172.16.0.2" />
+  <!-- Serial device for the Robotiq 2F gripper (see `ls /dev/ttyUSB*`). -->
+  <arg name="gripper_device" default="/dev/ttyUSB0" />
+  <!-- Host running the perception / IK inference servers
+       (Grounded-SAM2, AnyGrasp, AnyPlace, DIFT, cuRobo IK, Qwen VLM).
+       Point this at the machine serving those models. -->
+  <arg name="inference_host" default="127.0.0.1" />
+
+  <!-- Franka Impedance Controller -->
+  <include file="$(find serl_franka_controllers)/launch/impedance.launch">
+    <arg name="robot_ip" value="$(arg robot_ip)" />
+    <arg name="load_gripper" value="false" />
+  </include>
+
+  <!-- Franka Position Joint Trajectory Controller -->
+  <!-- <include file="$(find serl_franka_controllers)/launch/joint.launch">
+    <arg name="robot_ip" value="$(arg robot_ip)" />
+    <arg name="load_gripper" value="false" />
+  </include> -->
+
+  <!-- Static Transform Publisher (wrist camera -> panda_link8). -->
+  <node pkg="tf2_ros" type="static_transform_publisher" name="gripper_to_panda_ee_tf"
+        args="-0.067889 0.027693 0.026642 0.122394 -0.122913 0.716456 -0.675724 panda_link8 zed_wrist_left_optical_frame" />
+
+  <!-- Robotiq Gripper Node -->
+  <node pkg="robotiq_2f_gripper_control" type="Robotiq2FGripperRtuNode.py" name="robotiq_gripper"
+        args="$(arg gripper_device)" output="screen" />
+
+  <!-- Stream Camera ROS Client Node -->
+  <node pkg="franka_robot_apis" type="stream_camera_client_node.py" name="stream_camera_client" output="screen" />
+
+  <!-- Stream ZED Camera ROS Client Node -->
+  <node pkg="franka_robot_apis" type="stream_zed_camera_client_node.py" name="stream_zed_camera_client" output="screen" />
+
+  <!-- franka_robot_apis Nodes -->
+  <node pkg="franka_robot_apis" type="get_current_robot_state_service.py" name="robot_state_service" output="screen" />
+  <node pkg="franka_robot_apis" type="execute_impedance_trajectory_node.py" name="execute_impedance_trajectory" output="screen" />
+
+  <node pkg="franka_robot_apis" type="move_ee_cartesian_controller_node.py" name="ee_cartesian_controller" output="screen">
+    <param name="ws_host" value="$(arg inference_host)" />
+  </node>
+
+  <node pkg="franka_robot_apis" type="get_vqa_service.py" name="vqa_service" output="screen">
+    <param name="qwen_host" value="$(arg inference_host)" />
+  </node>
+
+  <node pkg="franka_robot_apis" type="get_grasp_vqa_service.py" name="grasp_vqa_service" output="screen">
+    <param name="qwen_host" value="$(arg inference_host)" />
+  </node>
+
+  <node pkg="franka_robot_apis" type="detect_objects_service.py" name="object_detection_service" output="screen">
+    <param name="sam2_url"     value="ws://$(arg inference_host):8766/detect_objects" />
+    <param name="anygrasp_url" value="ws://$(arg inference_host):8767/get_saved_grasp" />
+  </node>
+
+  <node pkg="franka_robot_apis" type="get_object_mask_service.py" name="object_mask_service" output="screen">
+    <param name="sam2_url" value="ws://$(arg inference_host):8766/get_object_mask" />
+  </node>
+
+  <node pkg="franka_robot_apis" type="get_grasp_config_service.py" name="grasp_config_service" output="screen">
+    <param name="anygrasp_url" value="ws://$(arg inference_host):8767/get_grasp_config" />
+  </node>
+
+  <node pkg="franka_robot_apis" type="set_gripper_width_service.py" name="gripper_width_service" output="screen" />
+
+  <node pkg="franka_robot_apis" type="get_placing_pose_service.py" name="placing_pose_service" output="screen">
+    <param name="sam2_url" value="ws://$(arg inference_host):8766/get_object_mask" />
+  </node>
+
+  <node pkg="franka_robot_apis" type="detect_marker_service.py" name="marker_detection_service" output="screen" />
+  <node pkg="franka_robot_apis" type="rotate_wrist_service.py" name="wrist_rotation_service" output="screen" />
+
+  <node pkg="franka_robot_apis" type="get_keypoints_service.py" name="get_keypoints_service" output="screen">
+    <param name="dift_base_url" value="ws://$(arg inference_host):8769" />
+  </node>
+
+</launch>

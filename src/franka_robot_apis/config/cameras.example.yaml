@@ -1,0 +1,44 @@
+# Camera configuration for franka_robot_apis.
+#
+# Copy to `cameras.yaml` and edit for your hardware.
+#
+# IMPORTANT: camera serials are READ FROM ENVIRONMENT VARIABLES by the streaming
+# nodes (so they are available at import time, before a ROS master is up). Set
+# them in your shell or in the package `.env` before launching:
+#
+#   RealSense (stream_camera_client_node.py):
+#     export SCENE_CAMERA_SERIAL=<your_scene_realsense_serial>   # e.g. D415
+#     export WRIST_CAMERA_SERIAL=<your_wrist_realsense_serial>   # e.g. D405
+#
+#   ZED (stream_zed_camera_client_node.py):
+#     export ZED_SCENE_SERIAL=<your_scene_zed_serial>            # integer, e.g. ZED 2i
+#     export ZED_WRIST_SERIAL=<your_wrist_zed_serial>            # integer, e.g. ZED-Mini
+#
+# The values below are EXAMPLE intrinsics/topics consumed by the perception
+# services as ~params. Replace the intrinsics with YOUR calibration.
+
+# Image topics (remappable on every perception node).
+topics:
+  scene_image_topic: "/realsense/scene/color/image_raw"
+  wrist_image_topic: "/zed/wrist/color/image_raw"
+
+# TF frames.
+frames:
+  base_frame: "panda_link0"
+  scene_optical_frame: "cam_scene_color_optical_frame"
+  wrist_optical_frame: "zed_wrist_left_optical_frame"
+
+# Pinhole intrinsics (EXAMPLE values — replace with your calibration).
+# Used as ~scene_fx/~scene_fy/~scene_cx/~scene_cy etc. by detection,
+# masking and keypoint services. Wrist defaults to scene unless overridden.
+scene_intrinsics:
+  fx: 752.0038452148438
+  fy: 751.7178344726562
+  cx: 628.4379272460938
+  cy: 335.1157531738281
+
+wrist_intrinsics:
+  fx: 752.0038452148438
+  fy: 751.7178344726562
+  cx: 628.4379272460938
+  cy: 335.1157531738281

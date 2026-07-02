@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+"""Grounded SAM2 + AnyGrasp object detection and grasp-pose service.
+
+ROS1 Noetic service node that segments an object via Grounded SAM2, computes a
+grasp pose via AnyGrasp, and transforms the result into the robot base frame.
+
+Service:
+    /robot/perception/detect_objects (robot_api_interfaces/RobotCommand)
+
+Request (JSON in `req`):
+    {
+        "text_prompt": "glass",
+        "camera": "scene"        # "wrist" or "scene" (default: "scene")
+    }
+
+Response (JSON in `data`):
+    {
+        "status": "success",
+        "best_grasp": {
+            "translation_wrt_base": [x, y, z],
+            "quaternion_wrt_base": {"x": ..., "y": ..., "z": ..., "w": ...},
+            "score": 0.2,
+            "width": 0.047
+        },
+        "camera": "scene"
+    }
+
+Examples:
+    rosrun <your_pkg> detect_objects_service_node_ros1.py
+
+    # Scene camera (default)
+    rosservice call /robot/perception/detect_objects \
+        '{"req": "{\"text_prompt\": \"floor\", \"camera\": \"scene\"}"}'
+
+    # Wrist camera
+    rosservice call /robot/perception/detect_objects \
+        '{"req": "{\"text_prompt\": \"cup\", \"camera\": \"wrist\"}"}'
+"""
+
+import json
+import asyncio
+import base64
+import threading
+import time
+import traceback
+
+import cv2
+import numpy as np
+import aiohttp
+
+import rospy
+import tf
+import tf.transformations as tft
+
+from sensor_msgs.msg import Image, CameraInfo
+from nav_msgs.msg import Odometry
+import ros_numpy
+
+from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse
+from robot_api_interfaces.msg import ResultCode
+
+
+# Allowed values for the "camera" field in the request JSON.
+VALID_CAMERAS = ("wrist", "scene")
+
+
+def _rotation_matrix_to_quaternion(R):
+    """Convert a 3x3 rotation matrix to a quaternion (Shepperd's method).
+
+    Args:
+        R: 3x3 rotation matrix (array-like).
+
+    Returns:
+        dict: Quaternion as {"x", "y", "z", "w"}.
+    """
+    R = np.array(R, dtype=np.float64)
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    return {"x": float(x), "y": float(y), "z": float(z), "w": float(w)}
+
+
+def _quaternion_multiply(q_a, q_b):
+    """Compute the Hamilton product q_a * q_b of two quaternions.
+
+    Args:
+        q_a: First quaternion as {"x", "y", "z", "w"}.
+        q_b: Second quaternion as {"x", "y", "z", "w"}.
+
+    Returns:
+        dict: The product quaternion as {"x", "y", "z", "w"}.
+    """
+    ax, ay, az, aw = q_a["x"], q_a["y"], q_a["z"], q_a["w"]
+    bx, by, bz, bw = q_b["x"], q_b["y"], q_b["z"], q_b["w"]
+    return {
+        "x": float(aw * bx + ax * bw + ay * bz - az * by),
+        "y": float(aw * by - ax * bz + ay * bw + az * bx),
+        "z": float(aw * bz + ax * by - ay * bx + az * bw),
+        "w": float(aw * bw - ax * bx - ay * by - az * bz),
+    }
+
+
+class CameraState:
+    """Holds latest RGB/depth frames, intrinsics, topics, and TF frame.
+
+    One instance is kept per camera (e.g. "scene" or "wrist").
+    """
+
+    def __init__(self, name, rgb_topic, depth_topic, camera_info_topic,
+                 camera_frame, fx, fy, cx, cy):
+        """Initialize per-camera state with topics, frame, and intrinsics."""
+        self.name              = name
+        self.rgb_topic         = rgb_topic
+        self.depth_topic       = depth_topic
+        self.camera_info_topic = camera_info_topic
+        self.camera_frame      = camera_frame
+
+        # Fallback intrinsics — overwritten on first CameraInfo message.
+        self.fx = fx
+        self.fy = fy
+        self.cx = cx
+        self.cy = cy
+        self.camera_info_received = False
+
+        self.latest_rgb   = None
+        self.latest_depth = None
+
+        self.lock = threading.Lock()
+
+
+class SegmentAndGraspNode:
+    """ROS1 service node chaining Grounded SAM2, AnyGrasp, and a TF transform.
+
+    The pipeline:
+      1. Grounded SAM segments the object and writes NPZ
+      2. AnyGrasp Web reads NPZ, returns best grasp pose
+      3. TF transform converts grasp pose from camera frame to panda_link0
+
+    The camera ("wrist" or "scene") is selectable per request via the
+    "camera" field in the request JSON.
+    """
+
+    def __init__(self):
+        """Read ROS params, build camera state, and register subs/service."""
+        # Parameters
+        self.sam2_url      = rospy.get_param("~sam2_url",     "ws://127.0.0.1:8766/detect_objects")
+        self.anygrasp_url  = rospy.get_param("~anygrasp_url", "ws://127.0.0.1:8767/get_saved_grasp")
+
+        # --- Scene camera params ---
+        scene_rgb_topic   = rospy.get_param("~scene_rgb_topic",         "/realsense/scene/color/image_raw")
+        scene_depth_topic = rospy.get_param("~scene_depth_topic",       "/realsense/scene/aligned_depth_to_color/image_raw")
+        scene_info_topic  = rospy.get_param("~scene_camera_info_topic", "/realsense/scene/aligned_depth_to_color/camera_info")
+        scene_frame       = rospy.get_param("~scene_camera_frame",      "cam_scene_color_optical_frame")
+        scene_fx = float(rospy.get_param("~scene_fx", 752.0038452148438))
+        scene_fy = float(rospy.get_param("~scene_fy", 751.7178344726562))
+        scene_cx = float(rospy.get_param("~scene_cx", 628.4379272460938))
+        scene_cy = float(rospy.get_param("~scene_cy", 335.1157531738281))
+
+        # --- Wrist camera params ---
+        wrist_rgb_topic   = rospy.get_param("~wrist_rgb_topic",         "/zed/wrist/color/image_raw")
+        wrist_depth_topic = rospy.get_param("~wrist_depth_topic",       "/zed/wrist/aligned_depth_to_color/image_raw")
+        wrist_info_topic  = rospy.get_param("~wrist_camera_info_topic", "/zed/wrist/aligned_depth_to_color/camera_info")
+        wrist_frame       = rospy.get_param("~wrist_camera_frame",      "zed_wrist_left_optical_frame")
+        wrist_fx = float(rospy.get_param("~wrist_fx", scene_fx))
+        wrist_fy = float(rospy.get_param("~wrist_fy", scene_fy))
+        wrist_cx = float(rospy.get_param("~wrist_cx", scene_cx))
+        wrist_cy = float(rospy.get_param("~wrist_cy", scene_cy))
+
+        # Default camera when the request does not specify one.
+        self.default_camera = rospy.get_param("~default_camera", "scene").lower()
+        if self.default_camera not in VALID_CAMERAS:
+            rospy.logwarn(
+                f"~default_camera='{self.default_camera}' is invalid; "
+                f"falling back to 'scene'. Valid options: {VALID_CAMERAS}"
+            )
+            self.default_camera = "scene"
+
+        # Timeouts
+        self.camera_wait_sec   = float(rospy.get_param("~camera_wait_sec",   1.0))
+        self.sam2_timeout_sec  = float(rospy.get_param("~sam2_timeout_sec",  15.0))
+        self.grasp_timeout_sec = float(rospy.get_param("~grasp_timeout_sec", 15.0))
+
+        # TF parameters (base_frame is shared; per-camera frame lives on CameraState).
+        self.base_frame     = rospy.get_param("~base_frame",     "panda_link0")
+        self.tf_timeout_sec = float(rospy.get_param("~tf_timeout_sec", 2.0))
+
+        # Camera state — one CameraState object per camera
+        self.cameras = {
+            "scene": CameraState(
+                name="scene",
+                rgb_topic=scene_rgb_topic,
+                depth_topic=scene_depth_topic,
+                camera_info_topic=scene_info_topic,
+                camera_frame=scene_frame,
+                fx=scene_fx, fy=scene_fy, cx=scene_cx, cy=scene_cy,
+            ),
+            "wrist": CameraState(
+                name="wrist",
+                rgb_topic=wrist_rgb_topic,
+                depth_topic=wrist_depth_topic,
+                camera_info_topic=wrist_info_topic,
+                camera_frame=wrist_frame,
+                fx=wrist_fx, fy=wrist_fy, cx=wrist_cx, cy=wrist_cy,
+            ),
+        }
+
+        # TF listener / broadcaster
+        self._tf_listener    = tf.TransformListener()
+        self._tf_broadcaster = tf.TransformBroadcaster()
+
+        # Subscriptions — one set per camera
+        self._subs = []
+        for cam in self.cameras.values():
+            self._subs.append(rospy.Subscriber(
+                cam.rgb_topic, Image,
+                lambda msg, _cam=cam: self._rgb_cb(msg, _cam),
+                queue_size=1, buff_size=2 ** 24,
+            ))
+            self._subs.append(rospy.Subscriber(
+                cam.depth_topic, Image,
+                lambda msg, _cam=cam: self._depth_cb(msg, _cam),
+                queue_size=1, buff_size=2 ** 24,
+            ))
+            self._subs.append(rospy.Subscriber(
+                cam.camera_info_topic, CameraInfo,
+                lambda msg, _cam=cam: self._camera_info_cb(msg, _cam),
+                queue_size=10,
+            ))
+
+        # Service
+        self._service = rospy.Service(
+            "/robot/perception/detect_objects",
+            RobotCommand,
+            self._handle_request,
+        )
+
+        rospy.loginfo(
+            "\nSegmentAndGraspNode (ROS1) ready.\n"
+            f"  Service        : /robot/perception/detect_objects\n"
+            f"  SAM2           : {self.sam2_url}\n"
+            f"  AnyGrasp       : {self.anygrasp_url}\n"
+            f"  Default camera : {self.default_camera}\n"
+            f"  Base frame     : {self.base_frame}\n"
+            f"  --- scene ---\n"
+            f"  RGB            : {self.cameras['scene'].rgb_topic}\n"
+            f"  Depth          : {self.cameras['scene'].depth_topic}\n"
+            f"  CamInfo        : {self.cameras['scene'].camera_info_topic}\n"
+            f"  Frame          : {self.cameras['scene'].camera_frame}\n"
+            f"  --- wrist ---\n"
+            f"  RGB            : {self.cameras['wrist'].rgb_topic}\n"
+            f"  Depth          : {self.cameras['wrist'].depth_topic}\n"
+            f"  CamInfo        : {self.cameras['wrist'].camera_info_topic}\n"
+            f"  Frame          : {self.cameras['wrist'].camera_frame}"
+        )
+
+    def _rgb_cb(self, msg, cam):
+        """Decode an incoming RGB image to BGR and store it on `cam`."""
+        try:
+            img = ros_numpy.numpify(msg)
+            enc = msg.encoding.lower()
+            if enc in ("rgb8",):
+                img = img[..., ::-1].copy()
+            elif enc in ("rgba8",):
+                img = img[..., :3][..., ::-1].copy()
+            elif enc in ("bgra8",):
+                img = img[..., :3].copy()
+            # bgr8 -> already correct; mono8/16 -> grayscale, left as-is
+            with cam.lock:
+                cam.latest_rgb = img
+        except Exception as e:
+            rospy.logwarn(f"[{cam.name}] RGB decode error: {e}")
+
+    def _depth_cb(self, msg, cam):
+        """Decode an incoming depth image to uint16 and store it on `cam`."""
+        try:
+            img = ros_numpy.numpify(msg)
+            if img.dtype != np.uint16:
+                img = img.astype(np.uint16)
+            with cam.lock:
+                cam.latest_depth = img
+        except Exception as e:
+            rospy.logwarn(f"[{cam.name}] Depth decode error: {e}")
+
+    def _camera_info_cb(self, msg, cam):
+        """Capture camera intrinsics from the first CameraInfo message."""
+        with cam.lock:
+            if not cam.camera_info_received:
+                cam.fx = float(msg.K[0])
+                cam.fy = float(msg.K[4])
+                cam.cx = float(msg.K[2])
+                cam.cy = float(msg.K[5])
+                cam.camera_info_received = True
+                rospy.loginfo(
+                    f"[{cam.name}] Camera intrinsics received: "
+                    f"fx={cam.fx:.2f} fy={cam.fy:.2f} "
+                    f"cx={cam.cx:.2f} cy={cam.cy:.2f}"
+                )
+
+    def _handle_request(self, request):
+        """Handle a detect_objects service request end to end.
+
+        Parses the JSON request, captures camera frames, runs Grounded SAM2
+        then AnyGrasp, transforms the grasp pose into the base frame, and
+        returns the populated RobotCommandResponse.
+
+        Note: rospy.Service callback — called in a dedicated thread per request.
+
+        Args:
+            request: RobotCommand request with a JSON string in `req`.
+
+        Returns:
+            RobotCommandResponse: Success payload, or a failure response.
+        """
+        rospy.loginfo(f"Service request received: {request.req}")
+        response = RobotCommandResponse()
+
+        # --- 1. Parse request -------------------------------------------
+        try:
+            req_data    = json.loads(request.req)
+            text_prompt = req_data.get("text_prompt", "").strip() or "object"
+            x_offset    = float(req_data.get("x_offset", 0.0))
+            y_offset    = float(req_data.get("y_offset", 0.0))
+            z_offset    = float(req_data.get("z_offset", 0.0))
+        except (json.JSONDecodeError, ValueError) as e:
+            return self._fail(response, f"Bad request: {e}")
+
+        # --- 1a. Resolve which camera to use ----------------------------
+        camera = req_data.get("camera", self.default_camera)
+        if not isinstance(camera, str):
+            return self._fail(
+                response,
+                f"'camera' must be a string, got {type(camera).__name__}.",
+            )
+        camera = camera.strip().lower()
+        if camera not in self.cameras:
+            return self._fail(
+                response,
+                f"Invalid 'camera' value: '{camera}'. "
+                f"Must be one of: {list(self.cameras.keys())}.",
+            )
+        cam = self.cameras[camera]
+
+        rospy.loginfo(
+            f"Using camera='{cam.name}' | rgb='{cam.rgb_topic}' "
+            f"depth='{cam.depth_topic}' frame='{cam.camera_frame}'"
+        )
+
+        # --- 2. Wait for camera frames ----------------------------------
+        rospy.loginfo(
+            f"Waiting up to {self.camera_wait_sec}s for {cam.name} camera frames ..."
+        )
+        deadline = time.time() + self.camera_wait_sec
+        has_frames = False
+        while time.time() < deadline:
+            with cam.lock:
+                has_frames = (cam.latest_rgb is not None and
+                              cam.latest_depth is not None)
+            if has_frames:
+                break
+            time.sleep(0.05)
+
+        if not has_frames:
+            return self._fail(
+                response,
+                f"Timed out waiting for {cam.name} camera frames on "
+                f"'{cam.rgb_topic}' / '{cam.depth_topic}'."
+            )
+
+        with cam.lock:
+            rgb   = cam.latest_rgb.copy()
+            depth = cam.latest_depth.copy()
+            fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
+            cam_info_ok    = cam.camera_info_received
+
+        if not cam_info_ok:
+            rospy.logwarn(
+                f"[{cam.name}] CameraInfo not yet received — using fallback intrinsics. "
+                f"fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}"
+            )
+
+        # --- 3. Call Grounded SAM2 --------------------------------------
+        rospy.loginfo(f"Calling Grounded SAM2 | prompt='{text_prompt}' camera='{cam.name}'")
+        sam2_result, sam2_err = self._call_sam2(
+            rgb, depth, fx, fy, cx, cy, text_prompt, cam
+        )
+
+        if sam2_err:
+            return self._fail(response, f"Grounded SAM2 failed: {sam2_err}")
+
+        if sam2_result.get("status") != "success":
+            return self._fail(
+                response,
+                f"Grounded SAM2 returned non-success status: "
+                f"{sam2_result.get('message', json.dumps(sam2_result))}"
+            )
+
+        rospy.loginfo("SAM2 succeeded — mask written to NPZ.")
+
+        # --- 4. Call AnyGrasp -------------------------------------------
+        rospy.loginfo("Calling AnyGrasp ...")
+        grasp_result, grasp_err = self._call_anygrasp()
+
+        if grasp_err:
+            return self._fail(response, f"AnyGrasp failed: {grasp_err}")
+
+        if grasp_result.get("status") != "success":
+            return self._fail(
+                response,
+                f"AnyGrasp returned non-success status: "
+                f"{grasp_result.get('message', json.dumps(grasp_result))}"
+            )
+
+        # --- 5. Transform grasp pose from camera frame to base_link -----
+        best = grasp_result["best_grasp"]
+        t    = best["translation"]
+        q    = _rotation_matrix_to_quaternion(best["rotation"])
+
+        rospy.loginfo(
+            f"Grasp found | score={best['score']:.4f}  width={best['width']:.4f}m  "
+            f"xyz=({t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f})  "
+            f"quat=({q['x']:.4f}, {q['y']:.4f}, {q['z']:.4f}, {q['w']:.4f})"
+        )
+
+        t_base, q_base, tf_err = self._transform_pose_to_base(t, q, cam.camera_frame)
+
+        if tf_err:
+            rospy.logwarn(
+                f"TF transform to '{self.base_frame}' failed: {tf_err}. "
+                "Returning camera-frame pose only."
+            )
+            t_base = None
+            q_base = None
+        else:
+            # Rotate 180° around Z to adjust end-effector orientation to match
+            # the AnyGrasp gripper convention.
+            q_180z = {"x": 0.0, "y": 0.0, "z": 1.0, "w": 0.0}
+            q_base = _quaternion_multiply(q_base, q_180z)
+            # Then rotate 90° around -Y to align gripper approach with +Z in base frame
+            q_90yz = {"x": 0.0, "y": -0.7071068, "z": 0.0, "w": 0.7071068}
+            q_base = _quaternion_multiply(q_base, q_90yz)
+
+            # Apply the requested offset in the grasp pose's local frame.
+            try:
+                shift_x = x_offset
+                shift_y = y_offset
+                shift_z = z_offset
+                # rotation matrix from base-frame quaternion
+                Q = [q_base['x'], q_base['y'], q_base['z'], q_base['w']]
+                R = tft.quaternion_matrix(Q)[0:3, 0:3]
+                # transform the local offset into the base frame
+                shift_global = R.dot(np.array([shift_x, shift_y, shift_z]))
+                t_shift = [
+                    float(t_base[0] + shift_global[0]),
+                    float(t_base[1] + shift_global[1]),
+                    float(t_base[2] + shift_global[2]),
+                ]
+
+                # Broadcast the shifted pose as frame 'shifted_grasp' (parent = base_frame)
+                now = rospy.Time.now()
+                self._tf_broadcaster.sendTransform(
+                    (t_shift[0], t_shift[1], t_shift[2]),
+                    (q_base['x'], q_base['y'], q_base['z'], q_base['w']),
+                    now,
+                    "shifted_grasp",
+                    self.base_frame,
+                )
+
+                # small pause to allow TF to propagate, then lookup shifted pose
+                rospy.sleep(0.05)
+                self._tf_listener.waitForTransform(
+                    self.base_frame,
+                    "shifted_grasp",
+                    rospy.Time(0),
+                    rospy.Duration(self.tf_timeout_sec),
+                )
+                trans_s, rot_s = self._tf_listener.lookupTransform(
+                    self.base_frame,
+                    "shifted_grasp",
+                    rospy.Time(0),
+                )
+
+                t_base = [float(trans_s[0]), float(trans_s[1]), float(trans_s[2])]
+                q_base = {"x": float(rot_s[0]), "y": float(rot_s[1]),
+                          "z": float(rot_s[2]), "w": float(rot_s[3])}
+
+                rospy.loginfo(
+                    f"Shifted pose in '{self.base_frame}' | "
+                    f"xyz=({t_base[0]:.4f}, {t_base[1]:.4f}, {t_base[2]:.4f})  "
+                    f"quat=({q_base['x']:.4f}, {q_base['y']:.4f}, "
+                    f"{q_base['z']:.4f}, {q_base['w']:.4f})"
+                )
+
+            except Exception as e:
+                rospy.logwarn(f"Failed to apply/lookup shifted grasp TF: {e}")
+                # keep original t_base/q_base if shifting fails
+
+        rospy.loginfo(
+            f"Shifted pose in '{self.base_frame}' | "
+            f"xyz=({t_base[0]:.4f}, {t_base[1]:.4f}, {t_base[2]:.4f})  "
+            f"quat=({q_base['x']:.4f}, {q_base['y']:.4f}, "
+            f"{q_base['z']:.4f}, {q_base['w']:.4f})"
+        )
+
+        # --- 6. Build and return response --------------------------------
+        payload = {
+            "status": "success",
+            "best_grasp": {
+                "translation_wrt_base": t_base,
+                "quaternion_wrt_base":  q_base,
+                "score":  best["score"],
+                "width":  best["width"],
+            },
+            "camera": cam.name,
+        }
+
+        response.result_code.result_code = ResultCode.SUCCESS
+        response.result_code.message     = "Segmentation and grasp detection succeeded."
+        response.data                    = json.dumps(payload)
+        return response
+
+    def _transform_pose_to_base(self, translation, quaternion, camera_frame):
+        """Transform a pose from camera_frame to self.base_frame.
+
+        Uses the ROS1 tf.TransformListener.
+
+        Args:
+            translation  (list): [x, y, z] in camera frame
+            quaternion   (dict): {"x", "y", "z", "w"} in camera frame
+            camera_frame (str):  the source TF frame for the selected camera
+
+        Returns:
+            tuple: (t_base, q_base, error_string)
+        """
+        try:
+            self._tf_listener.waitForTransform(
+                self.base_frame,
+                camera_frame,
+                rospy.Time(0),
+                rospy.Duration(self.tf_timeout_sec),
+            )
+
+            trans, rot = self._tf_listener.lookupTransform(
+                self.base_frame,
+                camera_frame,
+                rospy.Time(0),
+            )
+
+            # Build 4x4 homogeneous transform  T_base_cam
+            T_base_cam = tft.quaternion_matrix(rot)
+            T_base_cam[0, 3] = trans[0]
+            T_base_cam[1, 3] = trans[1]
+            T_base_cam[2, 3] = trans[2]
+
+            # Build 4x4 pose matrix  T_pose_cam  (grasp in camera frame)
+            q_list = [quaternion["x"], quaternion["y"],
+                      quaternion["z"], quaternion["w"]]
+            T_pose_cam = tft.quaternion_matrix(q_list)
+            T_pose_cam[0, 3] = translation[0]
+            T_pose_cam[1, 3] = translation[1]
+            T_pose_cam[2, 3] = translation[2]
+
+            # Transform: grasp pose in base frame
+            T_pose_base = np.dot(T_base_cam, T_pose_cam)
+
+            t_base = [
+                T_pose_base[0, 3],
+                T_pose_base[1, 3],
+                T_pose_base[2, 3],
+            ]
+
+            q_out = tft.quaternion_from_matrix(T_pose_base)
+            q_base = {"x": float(q_out[0]), "y": float(q_out[1]),
+                      "z": float(q_out[2]), "w": float(q_out[3])}
+
+            return t_base, q_base, None
+
+        except tf.LookupException as e:
+            return None, None, f"LookupException: {e}"
+        except tf.ConnectivityException as e:
+            return None, None, f"ConnectivityException: {e}"
+        except tf.ExtrapolationException as e:
+            return None, None, f"ExtrapolationException: {e}"
+        except Exception as e:
+            return None, None, f"Unexpected TF error: {e}\n{traceback.format_exc()}"
+
+    def _get_cam_to_base_quat(self, camera_frame):
+        """Look up the camera-to-base rotation quaternion.
+
+        Args:
+            camera_frame (str): The source TF frame for the selected camera.
+
+        Returns:
+            list | None: [qx, qy, qz, qw], or None if the TF is unavailable.
+        """
+        try:
+            self._tf_listener.waitForTransform(
+                self.base_frame,
+                camera_frame,
+                rospy.Time(0),
+                rospy.Duration(self.tf_timeout_sec),
+            )
+            _trans, rot = self._tf_listener.lookupTransform(
+                self.base_frame,
+                camera_frame,
+                rospy.Time(0),
+            )
+            rospy.loginfo(
+                f"cam_to_base_quat: [{rot[0]:.4f}, {rot[1]:.4f}, "
+                f"{rot[2]:.4f}, {rot[3]:.4f}]"
+            )
+            return list(rot)   # [x, y, z, w]
+
+        except Exception as e:
+            rospy.logwarn(
+                f"TF lookup for cam_to_base_quat failed - "
+                f"AnyGrasp horizontal filter will use fallback. Error: {e}"
+            )
+            return None
+
+    def _call_sam2(self, rgb, depth, fx, fy, cx, cy, text_prompt, cam):
+        """Call the Grounded SAM2 WebSocket server to segment the object.
+
+        Returns:
+            tuple: (result_dict, error_string). Exactly one is None.
+        """
+        try:
+            # Per-camera depth_scale param, e.g. /realsense/scene/depth_scale
+            depth_scale = rospy.get_param(f"/realsense/{cam.name}/depth_scale", 0.001)
+            payload = {
+                "text_prompt": text_prompt,
+                "rgb":         self._encode_rgb(rgb),
+                "depth":       self._encode_depth(depth),
+                "fx": fx, "fy": fy, "cx": cx, "cy": cy,
+                "depth_scale": float(depth_scale)
+            }
+
+            cam_to_base_quat = self._get_cam_to_base_quat(cam.camera_frame)
+            if cam_to_base_quat is not None:
+                payload["cam_to_base_quat"] = cam_to_base_quat
+            else:
+                rospy.logwarn(
+                    "cam_to_base_quat unavailable — AnyGrasp horizontal filter "
+                    "will fall back to camera_tilt_rad CLI flag."
+                )
+
+            result = asyncio.run(
+                self._ws_send_recv(
+                    self.sam2_url, json.dumps(payload),
+                    self.sam2_timeout_sec, max_msg_mb=50,
+                )
+            )
+            return result, None
+
+        except aiohttp.ClientConnectorError:
+            return None, f"Could not connect to SAM2 server at {self.sam2_url}"
+        except aiohttp.WSServerHandshakeError as e:
+            return None, f"SAM2 WebSocket handshake failed: {e}"
+        except asyncio.TimeoutError:
+            return None, f"SAM2 server timed out after {self.sam2_timeout_sec}s"
+        except json.JSONDecodeError as e:
+            return None, f"SAM2 response is not valid JSON: {e}"
+        except Exception as e:
+            return None, f"Unexpected SAM2 error: {e}\n{traceback.format_exc()}"
+
+    def _call_anygrasp(self):
+        """Call the AnyGrasp WebSocket server to compute the best grasp.
+
+        Returns:
+            tuple: (result_dict, error_string). Exactly one is None.
+        """
+        try:
+            result = asyncio.run(
+                self._ws_send_recv(
+                    self.anygrasp_url,
+                    json.dumps({"trigger": True}),
+                    self.grasp_timeout_sec, max_msg_mb=10,
+                )
+            )
+            return result, None
+
+        except aiohttp.ClientConnectorError:
+            return None, f"Could not connect to AnyGrasp server at {self.anygrasp_url}"
+        except aiohttp.WSServerHandshakeError as e:
+            return None, f"AnyGrasp WebSocket handshake failed: {e}"
+        except asyncio.TimeoutError:
+            return None, f"AnyGrasp server timed out after {self.grasp_timeout_sec}s"
+        except json.JSONDecodeError as e:
+            return None, f"AnyGrasp response is not valid JSON: {e}"
+        except Exception as e:
+            return None, f"Unexpected AnyGrasp error: {e}\n{traceback.format_exc()}"
+
+    async def _ws_send_recv(self, url, payload_str, timeout_sec, max_msg_mb=50):
+        """Send one message over a WebSocket and return the parsed JSON reply.
+
+        Args:
+            url (str): WebSocket server URL.
+            payload_str (str): JSON payload to send.
+            timeout_sec (float): Receive timeout in seconds.
+            max_msg_mb (int): Maximum allowed message size in megabytes.
+
+        Returns:
+            dict: Parsed JSON response.
+
+        Raises:
+            RuntimeError: If the connection errors or closes unexpectedly.
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(
+                url,
+                max_msg_size=max_msg_mb * 1024 * 1024,
+            ) as ws:
+                await ws.send_str(payload_str)
+                msg = await asyncio.wait_for(ws.receive(), timeout=timeout_sec)
+
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    return json.loads(msg.data)
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    raise RuntimeError(f"WebSocket error frame from {url}")
+                elif msg.type in (aiohttp.WSMsgType.CLOSE,
+                                  aiohttp.WSMsgType.CLOSING,
+                                  aiohttp.WSMsgType.CLOSED):
+                    raise RuntimeError(f"WebSocket closed unexpectedly by {url}")
+                else:
+                    raise RuntimeError(
+                        f"Unexpected WebSocket message type {msg.type} from {url}"
+                    )
+
+    @staticmethod
+    def _encode_rgb(bgr):
+        """Encode a BGR image as a base64 PNG string."""
+        ok, buf = cv2.imencode(".png", bgr)
+        if not ok:
+            raise RuntimeError("cv2.imencode failed for RGB image.")
+        return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+    @staticmethod
+    def _encode_depth(depth):
+        """Encode a depth image as a base64 PNG string (uint16)."""
+        if depth.dtype != np.uint16:
+            depth = depth.astype(np.uint16)
+        ok, buf = cv2.imencode(".png", depth)
+        if not ok:
+            raise RuntimeError("cv2.imencode failed for depth image.")
+        return base64.b64encode(buf.tobytes()).decode("utf-8")
+
+    def _fail(self, response, msg):
+        """Populate *response* as a failure, log the error, and return it.
+
+        Args:
+            response: RobotCommandResponse to populate.
+            msg (str): Human-readable error message.
+
+        Returns:
+            RobotCommandResponse: The populated failure response.
+        """
+        rospy.logerr(f"detect_objects service error: {msg}")
+        response.result_code.result_code = ResultCode.FAILURE
+        response.result_code.message     = msg
+        response.data = json.dumps({"status": "error", "message": msg})
+        return response
+
+    def spin(self):
+        """Block until ROS shutdown."""
+        rospy.spin()
+
+
+def main():
+    """Initialize and spin the SegmentAndGraspNode."""
+    rospy.init_node("detect_objects_service", anonymous=False)
+
+    try:
+        rospy.loginfo("Creating SegmentAndGraspNode ...")
+        node = SegmentAndGraspNode()
+        rospy.loginfo("SegmentAndGraspNode spinning ...")
+        node.spin()
+
+    except rospy.ROSInterruptException:
+        rospy.loginfo("ROS interrupt - shutting down SegmentAndGraspNode.")
+    except Exception as e:
+        rospy.logerr(f"Fatal error: {e}\n{traceback.format_exc()}")
+    finally:
+        rospy.loginfo("SegmentAndGraspNode shutdown complete.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,35 @@
+# Robot / workspace configuration for franka_robot_apis.
+#
+# Copy to `robot.yaml` and edit for your cell. These values are environment- and
+# safety-specific — review them before running on hardware.
+
+# Franka Control Interface (FCI) IP of the robot. 172.16.0.2 is the Franka
+# default; change to match your robot. Passed to the launch file as `robot_ip`.
+robot_ip: "172.16.0.2"
+
+# Serial device for the Robotiq 2F gripper. Passed to the launch as
+# `gripper_device`. Find yours with `ls /dev/ttyUSB*` (you may need to be in the
+# `dialout` group, or `sudo chmod 666 <device>`).
+gripper_device: "/dev/ttyUSB0"
+
+# ---- Cartesian motion / safety (consumed by move_ee_cartesian_controller_node) ----
+move_ee_controller_node:
+  # Home pose used by /robot/control/reset_robot.
+  reset_pose:
+    position:    {x: 0.4, y: 0.0, z: 0.45}
+    orientation: {x: 1.0, y: 0.0, z: 0.0, w: 0.0}
+  # External contact-force thresholds for guarded moves (Newtons, per axis).
+  default_force_threshold_x: 6.0
+  default_force_threshold_y: 6.0
+  default_force_threshold_z: 6.0
+  # Safety limits.
+  position_jump_tolerance: 0.3   # max per-waypoint jump (m)
+  max_move_distance: 1.0         # max single-move distance (m)
+
+# ---- Placement workspace bounds (consumed by get_placing_pose_service) ----
+# Axis-aligned bounds in panda_link0 (meters). Specific to the author's table;
+# set to your reachable, collision-free workspace.
+placing_pose_service:
+  x_range: [0.10, 0.90]
+  y_range: [-0.6, 0.6]
+  z_range: [-0.02, 0.6]
