@@ -2,8 +2,8 @@
 
 This is a ROS 1 (Noetic) catkin workspace. The repository **is** the workspace:
 packages live under `src/` (first-party at the top level, vendored dependencies
-under `src/third_party/`), and `libfranka/` is built and installed separately
-(do **not** install libfranka from conda/robostack).
+under `src/third_party/`). **libfranka is not shipped in this repo** — you clone
+and build it separately (step 3); do **not** install it from conda/robostack.
 
 The instructions use a [RoboStack](https://robostack.github.io/) conda
 environment so the whole stack (ROS Noetic + toolchain) is self-contained. Adapt
@@ -21,8 +21,8 @@ freely if you run native ROS Noetic on Ubuntu 20.04.
 | serl_franka_controllers | main |
 
 Pick a workspace location and export it once; the commands below reference it.
-Clone this repository into `$CATKIN_WS` so `$CATKIN_WS/src` and
-`$CATKIN_WS/libfranka` exist:
+Clone this repository into `$CATKIN_WS` (its `src/` becomes the workspace source;
+`libfranka` is added in step 3):
 
 ```bash
 export CATKIN_WS=~/architect_ws
@@ -73,17 +73,26 @@ Unused `robotiq` / `ros_canopen` subpackages are already marked with
 > **NOTE:** Do **not** install libfranka via conda / robostack
 > (e.g. `ros-noetic-libfranka`). Build it from source as below.
 
-## 3. Build and install libfranka (0.8.0)
+## 3. Clone, patch, and install libfranka (0.8.0)
 
-The vendored `libfranka/` tree may already include the small portability
-includes below; apply them only if the build complains about missing symbols:
+libfranka is **not** part of this repository. Clone the pinned version into the
+workspace root:
 
 ```bash
-# (only if needed)
+git clone --recursive --branch 0.8.0 \
+  https://github.com/frankaemika/libfranka "$CATKIN_WS/libfranka"
+```
+
+Apply two small portability `#include`s — required for the gcc-13 / ROS Noetic
+toolchain used here:
+
+```bash
 sed -i '5a #include <stdexcept>' "$CATKIN_WS/libfranka/src/control_types.cpp"
 sed -i '6a #include <string>'    "$CATKIN_WS/libfranka/include/franka/control_tools.h"
-sed -i '12a #include <cstdint>'  "$CATKIN_WS/src/third_party/franka_ros/franka_hw/include/franka_hw/resource_helpers.h"
 ```
+
+Build and install (it installs into `$CONDA_PREFIX`, which the catkin build later
+finds via `franka_DIR` — the in-tree source is not needed after this):
 
 ```bash
 cd "$CATKIN_WS/libfranka"
@@ -92,6 +101,10 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 cmake --build . -j"$(nproc)"
 cmake --install .
 ```
+
+> The vendored `franka_ros` in this repo already carries its one portability
+> include (`<cstdint>` in `franka_hw/resource_helpers.h`), so no patch is needed
+> there.
 
 ## 4. Build the workspace
 

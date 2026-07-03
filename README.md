@@ -46,8 +46,7 @@ For the method, experiments, and videos, see the **[project page](https://robo-a
 │   ├── franka_robot_apis/      # robot tool API: motion/gripper/perception services, camera clients
 │   ├── robot_api_interfaces/   # RobotCommand / RobotQuery service + ResultCode message
 │   └── third_party/            # vendored dependencies (see Acknowledgements)
-├── libfranka/                  # built and installed separately (see docs/INSTALL.md)
-└── docs/INSTALL.md
+└── docs/INSTALL.md             # libfranka is cloned + built separately (see docs/INSTALL.md - step 3)
 ```
 
 ## Prerequisites
