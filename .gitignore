@@ -14,4 +14,4 @@ src/franka_robot_apis/config/*.yaml
 
 # python
 *.pyc
-__pycache__/
+__pycache__/.venv/

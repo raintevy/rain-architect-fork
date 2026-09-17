@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import threading
 
-from anthropic import AnthropicFoundry
+from anthropic import Anthropic
 
 
 # Module-level singleton. Previously _make_client() ran on every call_claude
@@ -14,11 +14,11 @@ from anthropic import AnthropicFoundry
 # real-LLM sweep can issue 2000+ calls; each leaked client accumulates
 # until the process is OOM-killed (caught during the v3 sweep). Caching
 # the client once per process keeps memory flat over the run.
-_client: AnthropicFoundry | None = None
+_client: Anthropic | None = None
 _client_lock = threading.Lock()
 
 
-def _make_client() -> AnthropicFoundry:
+def _make_client() -> Anthropic:
     """Return the process-wide AnthropicFoundry client; build it on first call."""
     global _client
     if _client is not None:
@@ -27,7 +27,7 @@ def _make_client() -> AnthropicFoundry:
         if _client is not None:
             return _client
         from config import ANTHROPIC_BASE_URL  # late import — avoids circular import at module load
-        _client = AnthropicFoundry(
+        _client = Anthropic(
             api_key=os.environ["ANTHROPIC_API_KEY"],
             base_url=ANTHROPIC_BASE_URL,
         )

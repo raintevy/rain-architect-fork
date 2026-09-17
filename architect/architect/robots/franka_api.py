@@ -171,9 +171,6 @@ reset_robot()
     Move the robot to its home pose and fully open the gripper.
     Returns: True on success.
 
-
-## Trained-Policy Control Functions
-
 insert(obj: str, socket: dict)
     Insert a held ``obj`` into a ``socket`` using a learned insertion policy.
     Handles the contact-rich alignment and seating that move_ee_to_pose and

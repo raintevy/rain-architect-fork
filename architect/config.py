@@ -11,7 +11,7 @@ ANTHROPIC_MODEL = "claude-opus-4-6"
 #: Base URL for the Anthropic-compatible endpoint (e.g. an Azure AI Foundry
 #: deployment). Set ANTHROPIC_BASE_URL in your .env; leave unset to use the
 #: default Anthropic API.
-ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "")
+ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL") or None
 
 # --- Azure OpenAI (used for embeddings; optional) ---
 AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
