@@ -233,3 +233,10 @@ class FrankaRobotClient:
 
     def reset_robot(self) -> bool:
         return self._query("/robot/control/reset_robot")["success"]
+
+    def insert(self, obj: str, socket: dict) -> dict:
+        result = self._command(
+            "/robot/control/insert",
+            {"obj": obj, "socket": socket},
+        )
+        return result.get("data", {})

@@ -149,6 +149,7 @@ class FrankaConfig(RobotConfig):
             "rotate_wrist": client.rotate_wrist,
             "execute_waypoint_trajectory": client.execute_waypoint_trajectory,
             "reset_robot": client.reset_robot,
+            "insert": client.insert,
         }
         return namespace, client
 
