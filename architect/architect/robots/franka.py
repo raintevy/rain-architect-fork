@@ -117,6 +117,14 @@ class FrankaConfig(RobotConfig):
             "reset_robot": lambda: (
                 _stub("reset_robot") or True
             ),
+            "insert": lambda obj, socket: (
+                _stub("insert", obj, socket) or {
+                    "success": True,
+                    "reason": "success",
+                    "depth": 0.025,
+                    "steps": 87,
+                }
+            ),
         }
 
     def make_live_namespace(self) -> tuple[dict, object]:

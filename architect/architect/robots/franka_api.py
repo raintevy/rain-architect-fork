@@ -170,4 +170,35 @@ execute_waypoint_trajectory(waypoints: list[dict])
 reset_robot()
     Move the robot to its home pose and fully open the gripper.
     Returns: True on success.
+
+
+## Trained-Policy Control Functions
+
+insert(obj: str, socket: dict)
+    Insert a held ``obj`` into a ``socket`` using a learned insertion policy.
+    Handles the contact-rich alignment and seating that move_ee_to_pose and
+    move_ee_guarded cannot express. Currently supports the 8 mm round peg only.
+    obj: name of the object currently held (e.g. "peg"). Used to select the
+        policy and to verify the grasp — it does not steer the motion.
+    socket: {"position": {"x": float, "y": float, "z": float},
+             "orientation": {"x": float, "y": float, "z": float, "w": float}}
+        Socket opening pose in the panda_link0 base frame.
+    Preconditions:
+        - ``obj`` is already grasped along its central axis with the gripper
+          closed (as returned by detect_objects for the peg).
+        - EE is above the socket, pointing down, within about 2 cm laterally
+          and 4–6 cm vertically. Call move_ee_to_pose first to get there.
+        Outside this envelope the policy is out of distribution and will fail.
+    Returns a dict:
+    {
+        "success": bool,          # peg seated to within 1 mm of full depth
+        "reason": str,            # "success" | "timeout" | "not_grasped" | "out_of_range"
+        "depth": float,           # meters inserted at termination
+        "steps": int              # policy steps executed (max 150)
+    }
+    This is a learned policy and succeeds probabilistically, unlike the
+    planner-backed motion functions. Always check ``success``; on failure,
+    re-approach with move_ee_to_pose and retry rather than assuming the
+    object is seated. See `insertion.md` for retry patterns.
+
 """
