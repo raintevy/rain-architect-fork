@@ -12,11 +12,14 @@ Request (JSON in `req`):
                             "orientation": {"x":.., "y":.., "z":.., "w":..}},
 
 Response (JSON in `data`):
-    {"success": bool, "reason": str, "depth": float, "steps": int}
+    {"success": bool, "message": str,
+     "data": {"success": bool, "reason": str, "steps": int,
+              "seated_geom": bool, "seated_force": bool,
+              "fingertip_z_clearance": float, "axial_force": float}}
 
 Example service requests:
     rosservice call /robot/control/insert \
-      "req: '{\"obj\": \"peg\", {\"socket\": {\"x\": 0.0, \"y\": 0.1, \"z\": 0.3}}}'"
+      "req: '{\"obj\": \"peg\", \"socket\": {\"position\": {\"x\": 0.5, \"y\": 0.0, \"z\": 0.05}, \"orientation\": {\"x\": 0.0, \"y\": 0.0, \"z\": 0.0, \"w\": 1.0}}}'"
 """
 
 import json
@@ -27,6 +30,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 import rospy
+from geometry_msgs.msg import PoseStamped
 from robot_api_interfaces.srv import RobotCommand, RobotCommandResponse
 from robot_api_interfaces.msg import ResultCode
 from franka_msgs.msg import FrankaState
@@ -72,9 +76,20 @@ class InsertNode:
         # TODO: calibrate from a slow scripted approach to contact
 
         self.max_steps = rospy.get_param("~max_steps", 150)   # 10s episode at 15Hz
+
+        # Max distance between the FK target and the current EE position per step.
+        # One step moves each joint by at most action_scale (0.02 rad); with all 7 joints
+        # summed that is up to ~25-35 mm at the hand, so anything past 4 cm is a bug.
+        self.max_step_m = rospy.get_param("~max_step_m", 0.04)
         self.latest_franka_state = None
         rospy.Subscriber("/franka_state_controller/franka_states",
                         FrankaState, self._state_cb, queue_size=1)
+
+        self._equilibrium_pub = rospy.Publisher(
+            rospy.get_param("~equilibrium_pose_topic",
+                            "/cartesian_impedance_controller/equilibrium_pose"),
+            PoseStamped, queue_size=1,
+        )
 
         # ===== ROS Services =====
         rospy.Service("/robot/control/insert", RobotCommand, self._handle_insert)
@@ -84,15 +99,108 @@ class InsertNode:
         """Subscriber callback to store the incoming robot telemetry state."""
         self.latest_franka_state = msg
 
-    def _send_joint_targets(self, target_q):
-        """Sends the joint positions to the downstream controller.
-        
+    def _send_joint_targets(self, target_q, state):
+        """Converts target joint angles to an EE pose via FK and publishes it
+        as the Cartesian impedance controller's equilibrium pose.
+
         Args:
             target_q: List or numpy array of 7 target joint angles.
+            state: FrankaState snapshot target_q was decoded from.
+
+        Returns:
+            bool: True if published, False if the command was rejected as unsafe.
         """
-        # TODO: Implement connection to a joint position controller (e.g., publishing to a 
-        # ROS topic or contacting a continuous joint streaming service).
-        rospy.logdebug(f"Sending joint targets: {np.array2string(target_q, precision=4, separator=', ')}")
+        rospy.logdebug(f"Sending joint targets: {np.array2string(np.asarray(target_q), precision=4, separator=', ')}")
+
+        # 1. FK -> 4x4 target EE pose in the base frame (same frame as O_T_EE)
+        o_t_ee = self._forward_kinematics(target_q, state.F_T_EE)
+
+        # 2. Pull position and quaternion (scipy returns [x, y, z, w], same as ROS)
+        pos = o_t_ee[0:3, 3]
+        quat_xyzw = R.from_matrix(o_t_ee[0:3, 0:3]).as_quat()
+
+        if not (np.all(np.isfinite(pos)) and np.all(np.isfinite(quat_xyzw))):
+            rospy.logerr("FK produced a non-finite pose; not publishing.")
+            return False
+
+        # 3. Jump check: refuse targets too far from where the hand currently is
+        current = np.array(state.O_T_EE).reshape((4, 4), order="F")[0:3, 3]
+        jump = float(np.linalg.norm(pos - current))
+        if jump > self.max_step_m:
+            rospy.logerr(
+                f"FK target is {jump * 1000:.1f} mm from current EE "
+                f"(limit {self.max_step_m * 1000:.1f} mm); not publishing. "
+                f"target={np.array2string(pos, precision=4)} "
+                f"current={np.array2string(current, precision=4)}"
+            )
+            return False
+
+        # 4. Publish as the impedance controller's equilibrium pose
+        msg = PoseStamped()
+        msg.header.stamp = rospy.Time.now()
+        msg.header.frame_id = "panda_link0"
+        msg.pose.position.x = float(pos[0])
+        msg.pose.position.y = float(pos[1])
+        msg.pose.position.z = float(pos[2])
+        msg.pose.orientation.x = float(quat_xyzw[0])
+        msg.pose.orientation.y = float(quat_xyzw[1])
+        msg.pose.orientation.z = float(quat_xyzw[2])
+        msg.pose.orientation.w = float(quat_xyzw[3])
+        self._equilibrium_pub.publish(msg)
+
+        rospy.logdebug(f"Equilibrium pose: pos={np.array2string(pos, precision=4)} "
+                       f"quat_xyzw={np.array2string(quat_xyzw, precision=4)}")
+        return True
+
+    def _forward_kinematics(self, q, f_t_ee):
+        """Panda forward kinematics, base (panda_link0) -> EE frame.
+
+        Chains Franka's modified (Craig) DH parameters up to the flange, then
+        applies F_T_EE so the result is in the same frame as FrankaState.O_T_EE.
+
+        Args:
+            q:      7 joint angles (target_q in the loop)
+            f_t_ee: 16 floats from FrankaState.F_T_EE, column-major 4x4
+
+        Returns:
+            4x4 numpy homogeneous transform O_T_EE.
+        """
+        if len(q) != self.num_arm_joints:
+            raise ValueError(f"Expected {self.num_arm_joints} joint angles, got {len(q)}.")
+
+        # (a, d, alpha) per joint, modified DH
+        dh = [
+            (0.0,     0.333,  0.0),
+            (0.0,     0.0,   -np.pi / 2),
+            (0.0,     0.316,  np.pi / 2),
+            (0.0825,  0.0,    np.pi / 2),
+            (-0.0825, 0.384, -np.pi / 2),
+            (0.0,     0.0,    np.pi / 2),
+            (0.088,   0.0,    np.pi / 2),
+        ]
+
+        def _mdh(a, d, alpha, theta):
+            ct, st = np.cos(theta), np.sin(theta)
+            ca, sa = np.cos(alpha), np.sin(alpha)
+            return np.array([
+                [ct,      -st,      0.0,  a],
+                [st * ca,  ct * ca, -sa, -d * sa],
+                [st * sa,  ct * sa,  ca,  d * ca],
+                [0.0,      0.0,     0.0,  1.0],
+            ])
+
+        o_t_f = np.eye(4)
+        for (a, d, alpha), theta in zip(dh, q):
+            o_t_f = o_t_f @ _mdh(a, d, alpha, float(theta))
+
+        # Flange (panda_link8): 0.107 m along joint 7 axis
+        o_t_f = o_t_f @ _mdh(0.0, 0.107, 0.0, 0.0)
+
+        # Flange -> EE (column-major, like O_T_EE)
+        f_t_ee = np.array(f_t_ee, dtype=np.float64).reshape((4, 4), order="F")
+
+        return o_t_f @ f_t_ee
+
 
     def insert(self, obj, socket_pos, socket_quat_wxyz):
         """Run the insert policy execution loop under active pre/post-condition checks.
@@ -159,7 +267,8 @@ class InsertNode:
 
             # 2. Defensive check: Slice state.q to guarantee 7 elements (ignoring gripper variations)
             target_q = self._decode_action(action, state.q[:7])
-            self._send_joint_targets(target_q)
+            if not self._send_joint_targets(target_q, state):
+                return {"success": False, "reason": "unsafe_command", "steps": step, **post}
 
             # Evaluate postcondition metrics
             post = self._check_postcondition(
