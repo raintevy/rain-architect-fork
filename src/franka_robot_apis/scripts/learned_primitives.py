@@ -64,7 +64,14 @@ class InsertNode:
         self.num_arm_joints = 7
         self.action_scale = 0.02
 
-        self.FLANGE_TO_FINGERTIP_Z = 0.18   # TODO: measure on hardware
+        # Robot flange -> 2F-85 TCP along tool z. Robotiq 2F-85/2F-140 manual
+        # (2020-02-11) sec. 5.2.3: TCP z = 174.0 mm for a 2F-85 on coupling
+        # GRP-CPL-062, which mounts directly on the Panda's ISO 9409-1-50-4-M6
+        # flange. Gripper base -> fingertip end is 149.3 mm open / 162.8 mm
+        # closed (Figs. 5-1, 5-2), so 174.0 sits near the closed fingertip ends.
+        # Assumes O_T_EE is the flange (Desk end effector = none, F_T_EE = I).
+        # TODO: verify on hardware (older AGC-CPL-062-002 coupling is 3 mm thinner)
+        self.FLANGE_TO_FINGERTIP_Z = 0.174
 
         self.precond_xy    = 0.02
         self.precond_z     = (0.047, 0.057)

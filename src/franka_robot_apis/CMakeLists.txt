@@ -182,6 +182,7 @@ catkin_install_python(PROGRAMS
   scripts/detect_marker_service.py
   scripts/rotate_wrist_service.py
   scripts/get_keypoints_service.py
+  scripts/learned_primitives.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
